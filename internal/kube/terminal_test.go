@@ -72,6 +72,26 @@ func TestNormalizeLocale(t *testing.T) {
 	}
 }
 
+func TestLoginShellArgs(t *testing.T) {
+	for _, c := range []struct {
+		shell string
+		login bool
+	}{
+		{"/bin/zsh", true},
+		{"/usr/local/bin/bash", true},
+		{"/bin/rbash", true},
+		{`C:\Program Files\Git\bin\bash.exe`, true},
+		{`C:\TOOLS\ZSH.EXE`, true},
+		{"/bin/sh", false},
+		{"/usr/bin/fish", false},
+		{`C:\Program Files\PowerShell\7\pwsh.exe`, false},
+	} {
+		if got := loginShellArgs(c.shell) != nil; got != c.login {
+			t.Errorf("loginShellArgs(%q) login = %v, want %v", c.shell, got, c.login)
+		}
+	}
+}
+
 func TestWindowsShellPrefersExplicitShell(t *testing.T) {
 	const gitBash = `C:\Program Files\Git\bin\bash.exe`
 	getenv := func(k string) string {

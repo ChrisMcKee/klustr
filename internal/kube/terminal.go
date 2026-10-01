@@ -329,9 +329,9 @@ func userShell() string {
 // user's normal rc files (.zshrc / .bashrc / .profile) are sourced and
 // prompts, aliases and shell functions look like a regular Terminal tab.
 func loginShellArgs(shell string) []string {
-	base := strings.TrimSuffix(strings.ToLower(shell[strings.LastIndexAny(shell, `/\`)+1:]), ".exe")
-	switch base {
-	case "zsh", "bash":
+	name := strings.TrimSuffix(strings.ToLower(shell), ".exe")
+	switch {
+	case strings.HasSuffix(name, "zsh"), strings.HasSuffix(name, "bash"):
 		return []string{"-l"}
 	default:
 		return nil
