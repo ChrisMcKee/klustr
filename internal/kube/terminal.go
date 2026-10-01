@@ -294,10 +294,13 @@ func terminalShell() (string, []string) {
 }
 
 // windowsShell passes -NoLogo to PowerShell to keep the banner out of a tab
-// that already shows the context.
+// that already shows the context. SHELL only wins when it resolves: Cygwin,
+// WSL interop and Emacs setups export POSIX paths CreateProcess can't start.
 func windowsShell(getenv func(string) string, lookPath func(string) (string, error)) (string, []string) {
 	if s := getenv("SHELL"); s != "" {
-		return s, loginShellArgs(s)
+		if path, err := lookPath(s); err == nil {
+			return path, loginShellArgs(path)
+		}
 	}
 	for _, name := range []string{"pwsh.exe", "powershell.exe"} {
 		if path, err := lookPath(name); err == nil {

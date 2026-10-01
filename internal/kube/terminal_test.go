@@ -73,15 +73,34 @@ func TestNormalizeLocale(t *testing.T) {
 }
 
 func TestWindowsShellPrefersExplicitShell(t *testing.T) {
+	const gitBash = `C:\Program Files\Git\bin\bash.exe`
 	getenv := func(k string) string {
 		if k == "SHELL" {
-			return `C:\Program Files\Git\bin\bash.exe`
+			return gitBash
 		}
 		return ""
 	}
-	shell, args := windowsShell(getenv, func(string) (string, error) { return "", errors.New("unused") })
-	if shell != `C:\Program Files\Git\bin\bash.exe` || len(args) != 1 || args[0] != "-l" {
+	shell, args := windowsShell(getenv, func(name string) (string, error) { return name, nil })
+	if shell != gitBash || len(args) != 1 || args[0] != "-l" {
 		t.Errorf("got %q %v, want git bash with -l", shell, args)
+	}
+}
+
+func TestWindowsShellSkipsUnresolvableShell(t *testing.T) {
+	getenv := func(k string) string {
+		if k == "SHELL" {
+			return "/bin/bash"
+		}
+		return ""
+	}
+	lookPath := func(name string) (string, error) {
+		if name == "pwsh.exe" {
+			return `C:\bin\pwsh.exe`, nil
+		}
+		return "", errors.New("not found")
+	}
+	if shell, args := windowsShell(getenv, lookPath); shell != `C:\bin\pwsh.exe` || len(args) != 1 || args[0] != "-NoLogo" {
+		t.Errorf("got %q %v, want pwsh after a POSIX SHELL", shell, args)
 	}
 }
 
