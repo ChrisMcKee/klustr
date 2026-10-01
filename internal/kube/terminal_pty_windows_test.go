@@ -77,3 +77,9 @@ func TestConPTYCallsAfterCloseFail(t *testing.T) {
 	_ = proc.Kill()
 	_ = proc.Wait()
 }
+
+func TestHasEnvKeyIgnoresCaseOnWindows(t *testing.T) {
+	if !hasEnvKey([]string{"Term=dumb"}, "TERM") {
+		t.Error("Term=dumb not seen as TERM")
+	}
+}

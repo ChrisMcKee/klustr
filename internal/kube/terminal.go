@@ -275,10 +275,12 @@ func normalizeLocale(s string) string {
 	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), "-", ""))
 }
 
+// hasEnvKey matches names case-insensitively on Windows, where Term and
+// TERM are the same variable.
 func hasEnvKey(env []string, key string) bool {
-	prefix := key + "="
 	for _, e := range env {
-		if strings.HasPrefix(e, prefix) {
+		name, _, _ := strings.Cut(e, "=")
+		if name == key || (runtime.GOOS == "windows" && strings.EqualFold(name, key)) {
 			return true
 		}
 	}
