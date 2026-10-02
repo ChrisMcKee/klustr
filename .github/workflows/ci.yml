@@ -76,7 +76,7 @@ jobs:
       # Scoped to the terminal: the rest of the kube suite builds Unix
       # ':'-separated PATH lists.
       - name: go test (terminal)
-        run: go test -run "ConPTY|Terminal|WindowsShell|LoginShell|EnvKey" ./internal/kube/
+        run: go test -run "ConPTY|Terminal|WindowsShell|LoginShell|EnvKey|PSQuote|PSEncode|WindowsLauncher|Sweep|WSLEnv" ./internal/kube/
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
