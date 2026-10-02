@@ -1,12 +1,14 @@
 package kube
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 )
 
 func TestShellQuoteNeutralizesSubstitution(t *testing.T) {
@@ -70,9 +72,6 @@ func TestWritePodExecLauncherQuotesInputs(t *testing.T) {
 }
 
 func contextAssign(contextName string) string {
-	if runtime.GOOS == "windows" {
-		return "$env:KLUSTR_CONTEXT = " + psQuote(contextName)
-	}
 	return "KLUSTR_CONTEXT=" + shellQuote(contextName)
 }
 
@@ -89,36 +88,33 @@ func TestPSQuote(t *testing.T) {
 	}
 }
 
-func TestWriteWindowsLaunchersQuoteBreakout(t *testing.T) {
-	const evil = "'; calc.exe ’; calc.exe '"
-	shellPath, err := writeWindowsShellLauncher(`C:\temp\kc.yaml`, evil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(shellPath)
-	execPath, err := writeWindowsExecLauncher(`C:\temp\kc.yaml`, evil, evil, evil, evil, evil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(execPath)
-
+func TestWindowsLauncherScriptsQuoteBreakout(t *testing.T) {
+	const evil = "’; calc.exe ’; calc.exe ‘"
 	quoted := psQuote(evil)
-	for _, path := range []string{shellPath, execPath} {
-		body, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		script := string(body)
+	shellScript := windowsShellScript(`C:\temp\kc.yaml`, evil)
+	execScript := windowsExecScript(`C:\temp\kc.yaml`, evil, evil, evil, evil, evil)
+	for _, script := range []string{shellScript, execScript} {
 		if !strings.Contains(script, "$env:KLUSTR_CONTEXT = "+quoted) {
-			t.Fatalf("context name not PowerShell-quoted in %s:\n%s", path, script)
+			t.Fatalf("context name not PowerShell-quoted:\n%s", script)
 		}
 	}
-	execBody, err := os.ReadFile(execPath)
+	if !strings.Contains(execScript, "kubectl exec -it -n "+quoted+" -c "+quoted+" "+quoted+" -- "+quoted) {
+		t.Fatalf("kubectl args not quoted:\n%s", execScript)
+	}
+}
+
+func TestPSEncodeIsBase64UTF16LE(t *testing.T) {
+	const script = "$env:KLUSTR_CONTEXT = ‘prod-ü-😀’\n"
+	raw, err := base64.StdEncoding.DecodeString(psEncode(script))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(execBody), "kubectl exec -it -n "+quoted+" -c "+quoted+" "+quoted+" -- "+quoted) {
-		t.Fatalf("kubectl args not quoted:\n%s", execBody)
+	units := make([]uint16, len(raw)/2)
+	for i := range units {
+		units[i] = binary.LittleEndian.Uint16(raw[2*i:])
+	}
+	if got := string(utf16.Decode(units)); got != script {
+		t.Fatalf("decoded = %q, want %q", got, script)
 	}
 }
 

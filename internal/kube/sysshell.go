@@ -1,6 +1,8 @@
 package kube
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 // SystemTerminal is a terminal app discovered on the host. The frontend
@@ -94,12 +97,20 @@ func (m *ClientManager) OpenPodExecInSystemTerminal(
 	if err != nil {
 		return err
 	}
+	if runtime.GOOS == "windows" {
+		script := windowsExecScript(kubeconfigPath, contextName, namespace, podName, container, shellPath)
+		if err := launchWindowsTerminal(script, appID, false); err != nil {
+			_ = os.Remove(kubeconfigPath)
+			return err
+		}
+		return nil
+	}
 	scriptPath, err := writePodExecLauncher(kubeconfigPath, contextName, namespace, podName, container, shellPath)
 	if err != nil {
 		_ = os.Remove(kubeconfigPath)
 		return err
 	}
-	if err := launchExternalTerminal(scriptPath, appID, false); err != nil {
+	if err := launchExternalTerminal(scriptPath, appID); err != nil {
 		_ = os.Remove(kubeconfigPath)
 		_ = os.Remove(scriptPath)
 		return err
@@ -108,9 +119,6 @@ func (m *ClientManager) OpenPodExecInSystemTerminal(
 }
 
 func writePodExecLauncher(kubeconfigPath, contextName, namespace, podName, container, shellPath string) (string, error) {
-	if runtime.GOOS == "windows" {
-		return writeWindowsExecLauncher(kubeconfigPath, contextName, namespace, podName, container, shellPath)
-	}
 	suffix := ".sh"
 	if runtime.GOOS == "darwin" {
 		suffix = ".command"
@@ -177,12 +185,19 @@ func (m *ClientManager) OpenInSystemTerminal(contextName, appID string) error {
 	if err != nil {
 		return err
 	}
+	if runtime.GOOS == "windows" {
+		if err := launchWindowsTerminal(windowsShellScript(kubeconfigPath, contextName), appID, true); err != nil {
+			_ = os.Remove(kubeconfigPath)
+			return err
+		}
+		return nil
+	}
 	scriptPath, err := writeLauncherScript(kubeconfigPath, contextName)
 	if err != nil {
 		_ = os.Remove(kubeconfigPath)
 		return err
 	}
-	if err := launchExternalTerminal(scriptPath, appID, true); err != nil {
+	if err := launchExternalTerminal(scriptPath, appID); err != nil {
 		_ = os.Remove(kubeconfigPath)
 		_ = os.Remove(scriptPath)
 		return err
@@ -191,9 +206,6 @@ func (m *ClientManager) OpenInSystemTerminal(contextName, appID string) error {
 }
 
 func writeLauncherScript(kubeconfigPath, contextName string) (string, error) {
-	if runtime.GOOS == "windows" {
-		return writeWindowsShellLauncher(kubeconfigPath, contextName)
-	}
 	suffix := ".sh"
 	if runtime.GOOS == "darwin" {
 		// .command is the macOS double-clickable shell-script extension;
@@ -239,14 +251,12 @@ cd "$HOME" 2>/dev/null || true
 	return path, nil
 }
 
-func launchExternalTerminal(scriptPath, appID string, interactive bool) error {
+func launchExternalTerminal(scriptPath, appID string) error {
 	switch runtime.GOOS {
 	case "darwin":
 		return launchDarwinTerminal(scriptPath, appID)
 	case "linux":
 		return launchLinuxTerminal(scriptPath, appID)
-	case "windows":
-		return launchWindowsTerminal(scriptPath, appID, interactive)
 	default:
 		return fmt.Errorf("opening a system terminal is not supported on %s", runtime.GOOS)
 	}
@@ -261,7 +271,12 @@ func windowsPowerShellPath() (string, error) {
 	return "", fmt.Errorf("PowerShell is not on PATH")
 }
 
-func launchWindowsTerminal(scriptPath, appID string, interactive bool) error {
+// launchWindowsTerminal runs script in a new PowerShell tab or window. The
+// script goes in as -EncodedCommand rather than a temp .ps1: execution
+// policy covers script files only, and a Group Policy one (AllSigned, say)
+// overrides -ExecutionPolicy Bypass. -NoExit keeps the prompt once the
+// script returns.
+func launchWindowsTerminal(script, appID string, interactive bool) error {
 	if appID != "" {
 		return fmt.Errorf("unknown terminal app %q", appID)
 	}
@@ -269,14 +284,11 @@ func launchWindowsTerminal(scriptPath, appID string, interactive bool) error {
 	if err != nil {
 		return err
 	}
-	// Bypass is process-only. The default Restricted policy refuses a temp script.
-	// -NoExit keeps the prompt after -File returns; cleanup is the Exiting
-	// handler, backed by SweepStaleLaunchFiles when the window is closed.
-	args := []string{"-NoLogo", "-ExecutionPolicy", "Bypass"}
+	args := []string{"-NoLogo"}
 	if interactive {
 		args = append(args, "-NoExit")
 	}
-	args = append(args, "-File", scriptPath)
+	args = append(args, "-EncodedCommand", psEncode(script))
 	if wt, err := exec.LookPath("wt.exe"); err == nil {
 		return startDetached(exec.Command(wt, append([]string{"new-tab", "--", shell}, args...)...))
 	}
@@ -285,40 +297,39 @@ func launchWindowsTerminal(scriptPath, appID string, interactive bool) error {
 	return startDetached(cmd)
 }
 
-func writeWindowsShellLauncher(kubeconfigPath, contextName string) (string, error) {
-	f, err := os.CreateTemp("", "klustr-shell-*.ps1")
-	if err != nil {
-		return "", err
+// psEncode encodes script the way -EncodedCommand takes it: base64 over
+// UTF-16LE.
+func psEncode(script string) string {
+	var b []byte
+	for _, c := range utf16.Encode([]rune(script)) {
+		b = binary.LittleEndian.AppendUint16(b, c)
 	}
-	path := f.Name()
-	// The script returns immediately under -NoExit, so a try/finally would
-	// delete the kubeconfig before the prompt exists. The exit event runs
-	// when the window actually closes. It deletes through .NET: the runspace
-	// is already closing and can't load a module, so a Remove-Item whose
-	// module isn't loaded yet fails, silently under SilentlyContinue.
-	body := fmt.Sprintf(`$env:KUBECONFIG = %s
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// windowsShellScript sets up the interactive session. It finishes before the
+// prompt appears under -NoExit, so a try/finally would delete the kubeconfig
+// at once; the exit event runs when the session exits. It deletes through
+// .NET: the runspace is already closing and can't load a module, so a
+// Remove-Item whose module isn't loaded yet fails, silently under
+// SilentlyContinue.
+func windowsShellScript(kubeconfigPath, contextName string) string {
+	return fmt.Sprintf(`$env:KUBECONFIG = %s
 $env:KLUSTR_CONTEXT = %s
 $env:KUBE_CONTEXT = %s
 Set-Location -ErrorAction SilentlyContinue $env:USERPROFILE
 $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
     [IO.File]::Delete(%s)
-    [IO.File]::Delete(%s)
 }
-`, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(kubeconfigPath), psQuote(path))
-	return commitScript(f, path, "\uFEFF"+body)
+`, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(kubeconfigPath))
 }
 
-func writeWindowsExecLauncher(kubeconfigPath, contextName, namespace, podName, container, shellPath string) (string, error) {
-	f, err := os.CreateTemp("", "klustr-exec-*.ps1")
-	if err != nil {
-		return "", err
-	}
-	path := f.Name()
+func windowsExecScript(kubeconfigPath, contextName, namespace, podName, container, shellPath string) string {
 	containerArg := ""
 	if container != "" {
 		containerArg = "-c " + psQuote(container) + " "
 	}
-	body := fmt.Sprintf(`$env:KUBECONFIG = %s
+	return fmt.Sprintf(`$env:KUBECONFIG = %s
 $env:KLUSTR_CONTEXT = %s
 $env:KUBE_CONTEXT = %s
 try {
@@ -331,27 +342,8 @@ try {
     kubectl exec -it -n %s %s%s -- %s
 } finally {
     Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
 }
-`, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(namespace), containerArg, psQuote(podName), psQuote(shellPath), psQuote(kubeconfigPath), psQuote(path))
-	return commitScript(f, path, "\uFEFF"+body)
-}
-
-func commitScript(f *os.File, path, body string) (string, error) {
-	if _, err := f.WriteString(body); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return "", err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", err
-	}
-	if err := os.Chmod(path, 0o700); err != nil {
-		_ = os.Remove(path)
-		return "", err
-	}
-	return path, nil
+`, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(namespace), containerArg, psQuote(podName), psQuote(shellPath), psQuote(kubeconfigPath))
 }
 
 // staleLaunchFileAge is how long a launcher's temp files may outlive it
