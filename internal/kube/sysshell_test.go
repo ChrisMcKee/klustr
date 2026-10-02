@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -134,8 +135,6 @@ func TestSweepStaleLaunchFilesRemovesOnlyOldLaunchFiles(t *testing.T) {
 	}
 	stale := []string{
 		write("klustr-kubeconfig-1.yaml", old),
-		write("klustr-shell-1.ps1", old),
-		write("klustr-exec-1.sh", old),
 	}
 	kept := []string{
 		write("klustr-kubeconfig-2.yaml", time.Now()),
@@ -153,5 +152,33 @@ func TestSweepStaleLaunchFilesRemovesOnlyOldLaunchFiles(t *testing.T) {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("file %s removed: %v", filepath.Base(p), err)
 		}
+	}
+}
+
+// A live terminal holds its kubeconfig open; the sweep relies on Windows
+// refusing to delete it.
+func TestSweepStaleLaunchFilesSkipsOpenKubeconfig(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("an open file blocks deletion only on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "klustr-kubeconfig-1.yaml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * staleLaunchFileAge)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	sweepStaleLaunchFiles(dir, time.Now().Add(-staleLaunchFileAge))
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("open kubeconfig removed: %v", err)
 	}
 }

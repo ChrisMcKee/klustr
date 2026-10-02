@@ -310,13 +310,18 @@ func psEncode(script string) string {
 // at once; the exit event runs when the session exits. It deletes through
 // .NET: the runspace is already closing and can't load a module, so a
 // Remove-Item whose module isn't loaded yet fails, silently under
-// SilentlyContinue.
+// SilentlyContinue. The open handle, which shares read and write but not
+// delete, keeps SweepStaleLaunchFiles off the kubeconfig while the session
+// lives. It reaches the action through a global: PowerShell.Exiting leaves
+// $Event.MessageData null.
 func windowsShellScript(kubeconfigPath, contextName string) string {
 	return fmt.Sprintf(`$env:KUBECONFIG = %s
 $env:KLUSTR_CONTEXT = %s
 $env:KUBE_CONTEXT = %s
 Set-Location -ErrorAction SilentlyContinue $env:USERPROFILE
+$global:KlustrKubeconfigLock = [IO.File]::Open($env:KUBECONFIG, 'Open', 'Read', 'ReadWrite')
 $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    $global:KlustrKubeconfigLock.Dispose()
     [IO.File]::Delete(%s)
 }
 `, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(kubeconfigPath))
@@ -327,9 +332,12 @@ func windowsExecScript(kubeconfigPath, contextName, namespace, podName, containe
 	if container != "" {
 		containerArg = "-c " + psQuote(container) + " "
 	}
+	// The lock keeps SweepStaleLaunchFiles off the kubeconfig, as in
+	// windowsShellScript.
 	return fmt.Sprintf(`$env:KUBECONFIG = %s
 $env:KLUSTR_CONTEXT = %s
 $env:KUBE_CONTEXT = %s
+$kubeconfigLock = [IO.File]::Open($env:KUBECONFIG, 'Open', 'Read', 'ReadWrite')
 try {
     if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) {
         Write-Host 'kubectl not found on PATH. Install kubectl or use the in-app Exec tab.'
@@ -339,35 +347,37 @@ try {
     }
     kubectl exec -it -n %s %s%s -- %s
 } finally {
+    $kubeconfigLock.Dispose()
     Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
 }
 `, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(namespace), containerArg, psQuote(podName), psQuote(shellPath), psQuote(kubeconfigPath))
 }
 
-// staleLaunchFileAge is how long a launcher's temp files may outlive it
+// staleLaunchFileAge covers the moment before a new terminal opens its
+// kubeconfig, which another klustr instance's sweep could otherwise hit.
 const staleLaunchFileAge = 24 * time.Hour
 
-var launchFilePatterns = []string{
-	"klustr-kubeconfig-*.yaml",
-	"klustr-shell-*",
-	"klustr-exec-*",
-}
-
-// SweepStaleLaunchFiles deletes abandoned temp kubeconfigs and launcher scripts
+// SweepStaleLaunchFiles deletes the temp kubeconfigs that external Windows
+// terminals leave behind: closing the window skips PowerShell's Exiting
+// handler. Unix launchers clean up in their EXIT trap instead. A live
+// terminal, in-app or external, holds its kubeconfig open without
+// FILE_SHARE_DELETE, so Windows refuses to delete it and the sweep only
+// takes abandoned ones.
 func (m *ClientManager) SweepStaleLaunchFiles() {
+	if runtime.GOOS != "windows" {
+		return
+	}
 	sweepStaleLaunchFiles(os.TempDir(), time.Now().Add(-staleLaunchFileAge))
 }
 
 func sweepStaleLaunchFiles(dir string, cutoff time.Time) {
-	for _, pattern := range launchFilePatterns {
-		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
-		for _, path := range matches {
-			info, err := os.Lstat(path)
-			if err != nil || !info.Mode().IsRegular() || info.ModTime().After(cutoff) {
-				continue
-			}
-			_ = os.Remove(path)
+	matches, _ := filepath.Glob(filepath.Join(dir, "klustr-kubeconfig-*.yaml"))
+	for _, path := range matches {
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.ModTime().After(cutoff) {
+			continue
 		}
+		_ = os.Remove(path)
 	}
 }
 

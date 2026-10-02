@@ -34,7 +34,11 @@ type terminalSession struct {
 	proc       ptyProcess
 	cancel     context.CancelFunc
 	kubeconfig string
-	once       sync.Once
+	// kubeconfigLock holds the kubeconfig open for the session. Go opens
+	// files without FILE_SHARE_DELETE, so on Windows another klustr
+	// instance's SweepStaleLaunchFiles can't delete it under a live tab.
+	kubeconfigLock *os.File
+	once           sync.Once
 }
 
 func (s *terminalSession) close() {
@@ -43,6 +47,9 @@ func (s *terminalSession) close() {
 		if s.proc != nil {
 			_ = s.proc.Close()
 			_ = s.proc.Kill()
+		}
+		if s.kubeconfigLock != nil {
+			_ = s.kubeconfigLock.Close()
 		}
 		if s.kubeconfig != "" {
 			_ = os.Remove(s.kubeconfig)
@@ -103,12 +110,14 @@ func (mgr *terminalSessionManager) start(
 	}
 
 	id := fmt.Sprintf("term-%d", atomic.AddUint64(&mgr.counter, 1))
+	lock, _ := os.Open(kubeconfigPath)
 	sess := &terminalSession{
-		id:         id,
-		context:    contextName,
-		proc:       proc,
-		cancel:     cancel,
-		kubeconfig: kubeconfigPath,
+		id:             id,
+		context:        contextName,
+		proc:           proc,
+		cancel:         cancel,
+		kubeconfig:     kubeconfigPath,
+		kubeconfigLock: lock,
 	}
 
 	mgr.mu.Lock()
