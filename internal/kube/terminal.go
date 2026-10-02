@@ -232,13 +232,7 @@ func (mgr *terminalSessionManager) stopAll() {
 // keystroke several times; without a UTF-8 locale, prompt glyphs garble. An
 // empty locale (none confirmed on this host) leaves the locale untouched.
 func terminalEnv(base []string, kubeconfigPath, contextName, locale string) []string {
-	env := append([]string{}, base...)
-	env = append(env,
-		"KUBECONFIG="+kubeconfigPath,
-		"KLUSTR_CONTEXT="+contextName,
-		// Hint for users with PS1 logic that wants to surface the cluster.
-		"KUBE_CONTEXT="+contextName,
-	)
+	env := contextEnv(base, kubeconfigPath, contextName)
 	if !hasEnvKey(env, "TERM") {
 		env = append(env, "TERM=xterm-256color")
 	}
@@ -248,15 +242,34 @@ func terminalEnv(base []string, kubeconfigPath, contextName, locale string) []st
 	if locale != "" && !hasEnvKey(env, "LANG") && !hasEnvKey(env, "LC_ALL") && !hasEnvKey(env, "LC_CTYPE") {
 		env = append(env, "LANG="+locale)
 	}
+	return env
+}
+
+// contextEnv points a shell, in-app or external, at one context.
+func contextEnv(base []string, kubeconfigPath, contextName string) []string {
+	env := append([]string{}, base...)
+	env = append(env,
+		"KUBECONFIG="+kubeconfigPath,
+		"KLUSTR_CONTEXT="+contextName,
+		// Hint for users with PS1 logic that wants to surface the cluster.
+		"KUBE_CONTEXT="+contextName,
+	)
 	if runtime.GOOS == "windows" {
-		// wsl.exe forwards a variable only when WSLENV names it, and /p
-		// rewrites the Win32 path so `wsl` keeps this tab's kubeconfig.
-		env = append(env, "WSLENV="+wslEnvKubeconfig(env))
+		// wsl.exe forwards a variable only when WSLENV names it.
+		env = append(env, "WSLENV="+wslEnvShared(env))
 	}
 	return env
 }
 
-func wslEnvKubeconfig(env []string) string {
+// wslSharedVars are the WSLENV entries for contextEnv's variables. /p
+// rewrites the kubeconfig's Win32 path into its /mnt form.
+var wslSharedVars = []string{"KUBECONFIG/p", "KLUSTR_CONTEXT", "KUBE_CONTEXT"}
+
+// wslEnvShared returns env's WSLENV with wslSharedVars in it. WSLENV names
+// are case-sensitive, so only exact names are replaced. A user's own
+// KUBECONFIG entry goes too: its flags were picked for their value, and this
+// one is always a single Win32 path, which needs /p.
+func wslEnvShared(env []string) string {
 	var existing string
 	for _, e := range env {
 		name, v, ok := strings.Cut(e, "=")
@@ -264,16 +277,23 @@ func wslEnvKubeconfig(env []string) string {
 			existing = v
 		}
 	}
+	parts := []string{}
 	for part := range strings.SplitSeq(existing, ":") {
-		name, _, _ := strings.Cut(part, "/")
-		if strings.EqualFold(strings.TrimSpace(name), "KUBECONFIG") {
-			return existing
+		if part != "" && !isWSLSharedVar(part) {
+			parts = append(parts, part)
 		}
 	}
-	if existing == "" {
-		return "KUBECONFIG/p"
+	return strings.Join(append(parts, wslSharedVars...), ":")
+}
+
+func isWSLSharedVar(entry string) bool {
+	name, _, _ := strings.Cut(entry, "/")
+	for _, v := range wslSharedVars {
+		if shared, _, _ := strings.Cut(v, "/"); shared == name {
+			return true
+		}
 	}
-	return existing + ":KUBECONFIG/p"
+	return false
 }
 
 // defaultUTF8Locale returns a UTF-8 locale that `locale -a` confirms exists,

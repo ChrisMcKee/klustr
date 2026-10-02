@@ -61,20 +61,29 @@ func TestTerminalEnvSkipsLocaleWhenNoneConfirmed(t *testing.T) {
 	}
 }
 
-func TestWSLEnvKubeconfig(t *testing.T) {
-	if got := wslEnvKubeconfig(nil); got != "KUBECONFIG/p" {
-		t.Errorf("empty = %q, want KUBECONFIG/p", got)
-	}
-	if got := wslEnvKubeconfig([]string{"WSLENV=FOO/p"}); got != "FOO/p:KUBECONFIG/p" {
-		t.Errorf("append = %q", got)
-	}
-	const already = "FOO/p:KUBECONFIG/up"
-	if got := wslEnvKubeconfig([]string{"WSLENV=" + already}); got != already {
-		t.Errorf("existing = %q, want %q", got, already)
+func TestWSLEnvShared(t *testing.T) {
+	const shared = "KUBECONFIG/p:KLUSTR_CONTEXT:KUBE_CONTEXT"
+	for _, c := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"unset", nil, shared},
+		{"appended", []string{"WSLENV=FOO/p"}, "FOO/p:" + shared},
+		{"variable name ignores case", []string{"WslEnv=FOO/p"}, "FOO/p:" + shared},
+		// /w alone would never reach wsl, a bare name skips the path rewrite.
+		{"kubeconfig entry replaced", []string{"WSLENV=KUBECONFIG/w:FOO:KUBECONFIG"}, "FOO:" + shared},
+		{"no duplicates", []string{"WSLENV=KLUSTR_CONTEXT/u:FOO:KUBECONFIG/up"}, "FOO:" + shared},
+		{"entry names keep case", []string{"WSLENV=kubeconfig/p"}, "kubeconfig/p:" + shared},
+		{"empty entries dropped", []string{"WSLENV=:FOO::"}, "FOO:" + shared},
+	} {
+		if got := wslEnvShared(c.env); got != c.want {
+			t.Errorf("%s: wslEnvShared(%q) = %q, want %q", c.name, c.env, got, c.want)
+		}
 	}
 }
 
-func TestTerminalEnvSharesKubeconfigWithWSL(t *testing.T) {
+func TestTerminalEnvSharesContextWithWSL(t *testing.T) {
 	env := terminalEnv([]string{"WSLENV=FOO/p"}, `C:\Temp\klustr.yaml`, "prod", "")
 	got, _ := envValue(env, "WSLENV")
 	if runtime.GOOS != "windows" {
@@ -83,8 +92,8 @@ func TestTerminalEnvSharesKubeconfigWithWSL(t *testing.T) {
 		}
 		return
 	}
-	if got != "FOO/p:KUBECONFIG/p" {
-		t.Errorf("WSLENV = %q, want FOO/p:KUBECONFIG/p", got)
+	if want := "FOO/p:KUBECONFIG/p:KLUSTR_CONTEXT:KUBE_CONTEXT"; got != want {
+		t.Errorf("WSLENV = %q, want %q", got, want)
 	}
 }
 
