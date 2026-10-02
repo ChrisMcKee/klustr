@@ -293,14 +293,16 @@ func writeWindowsShellLauncher(kubeconfigPath, contextName string) (string, erro
 	path := f.Name()
 	// The script returns immediately under -NoExit, so a try/finally would
 	// delete the kubeconfig before the prompt exists. The exit event runs
-	// when the window actually closes.
+	// when the window actually closes. It deletes through .NET: the runspace
+	// is already closing and can't load a module, so a Remove-Item whose
+	// module isn't loaded yet fails, silently under SilentlyContinue.
 	body := fmt.Sprintf(`$env:KUBECONFIG = %s
 $env:KLUSTR_CONTEXT = %s
 $env:KUBE_CONTEXT = %s
 Set-Location -ErrorAction SilentlyContinue $env:USERPROFILE
 $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-    Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
+    [IO.File]::Delete(%s)
+    [IO.File]::Delete(%s)
 }
 `, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(kubeconfigPath), psQuote(path))
 	return commitScript(f, path, "\uFEFF"+body)
