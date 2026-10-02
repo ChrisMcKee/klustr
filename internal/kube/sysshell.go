@@ -26,6 +26,13 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// psQuote single-quotes s for PowerShell. A single-quoted string is literal
+// except for an embedded quote, which is doubled, so $(...), backticks and
+// $vars cannot break out. The context name comes from the kubeconfig.
+func psQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
 type darwinTerminalApp struct {
 	id      string
 	name    string
@@ -45,9 +52,9 @@ var darwinKnownTerminals = []darwinTerminalApp{
 }
 
 // ListSystemTerminals returns the terminal emulators installed on the
-// host. Empty on Windows. On macOS this scans /Applications +
-// ~/Applications; on Linux it probes the PATH for the same priority
-// list that launchLinuxTerminal would itself try.
+// host. On macOS this scans /Applications + ~/Applications; on Linux it
+// probes PATH. Windows has no picker list: an empty appID opens Windows
+// Terminal, or a new console when wt is not on PATH.
 func (m *ClientManager) ListSystemTerminals() []SystemTerminal {
 	switch runtime.GOOS {
 	case "darwin":
@@ -67,9 +74,6 @@ func (m *ClientManager) OpenPodExecInSystemTerminal(
 	if contextName == "" || namespace == "" || podName == "" {
 		return fmt.Errorf("context, namespace and pod are required")
 	}
-	if runtime.GOOS == "windows" {
-		return fmt.Errorf("opening a system terminal is not supported on Windows yet")
-	}
 	if shellPath == "" {
 		shellPath = "/bin/sh"
 	}
@@ -83,7 +87,7 @@ func (m *ClientManager) OpenPodExecInSystemTerminal(
 		_ = os.Remove(kubeconfigPath)
 		return err
 	}
-	if err := launchExternalTerminal(scriptPath, appID); err != nil {
+	if err := launchExternalTerminal(scriptPath, appID, false); err != nil {
 		_ = os.Remove(kubeconfigPath)
 		_ = os.Remove(scriptPath)
 		return err
@@ -92,6 +96,9 @@ func (m *ClientManager) OpenPodExecInSystemTerminal(
 }
 
 func writePodExecLauncher(kubeconfigPath, contextName, namespace, podName, container, shellPath string) (string, error) {
+	if runtime.GOOS == "windows" {
+		return writeWindowsExecLauncher(kubeconfigPath, contextName, namespace, podName, container, shellPath)
+	}
 	suffix := ".sh"
 	if runtime.GOOS == "darwin" {
 		suffix = ".command"
@@ -147,13 +154,11 @@ kubectl exec -it -n %s %s%s -- %s
 // OpenInSystemTerminal opens the user's login shell in an external terminal
 // with KUBECONFIG set to a single-context copy; an EXIT trap deletes the temp
 // kubeconfig and launcher script. appID is an id from ListSystemTerminals;
-// empty means the macOS .command handler or the Linux priority list.
+// empty means the macOS .command handler, the Linux priority list, or
+// Windows Terminal (a new console when wt is not on PATH).
 func (m *ClientManager) OpenInSystemTerminal(contextName, appID string) error {
 	if contextName == "" {
 		return fmt.Errorf("context name is required")
-	}
-	if runtime.GOOS == "windows" {
-		return fmt.Errorf("opening a system terminal is not supported on Windows yet")
 	}
 
 	kubeconfigPath, err := writeContextKubeconfig(m.rules, contextName)
@@ -165,7 +170,7 @@ func (m *ClientManager) OpenInSystemTerminal(contextName, appID string) error {
 		_ = os.Remove(kubeconfigPath)
 		return err
 	}
-	if err := launchExternalTerminal(scriptPath, appID); err != nil {
+	if err := launchExternalTerminal(scriptPath, appID, true); err != nil {
 		_ = os.Remove(kubeconfigPath)
 		_ = os.Remove(scriptPath)
 		return err
@@ -174,6 +179,9 @@ func (m *ClientManager) OpenInSystemTerminal(contextName, appID string) error {
 }
 
 func writeLauncherScript(kubeconfigPath, contextName string) (string, error) {
+	if runtime.GOOS == "windows" {
+		return writeWindowsShellLauncher(kubeconfigPath, contextName)
+	}
 	suffix := ".sh"
 	if runtime.GOOS == "darwin" {
 		// .command is the macOS double-clickable shell-script extension;
@@ -219,15 +227,116 @@ cd "$HOME" 2>/dev/null || true
 	return path, nil
 }
 
-func launchExternalTerminal(scriptPath, appID string) error {
+func launchExternalTerminal(scriptPath, appID string, interactive bool) error {
 	switch runtime.GOOS {
 	case "darwin":
 		return launchDarwinTerminal(scriptPath, appID)
 	case "linux":
 		return launchLinuxTerminal(scriptPath, appID)
+	case "windows":
+		return launchWindowsTerminal(scriptPath, appID, interactive)
 	default:
 		return fmt.Errorf("opening a system terminal is not supported on %s", runtime.GOOS)
 	}
+}
+
+func windowsPowerShellPath() (string, error) {
+	for _, name := range []string{"pwsh.exe", "powershell.exe"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("PowerShell is not on PATH")
+}
+
+func launchWindowsTerminal(scriptPath, appID string, interactive bool) error {
+	if appID != "" {
+		return fmt.Errorf("unknown terminal app %q", appID)
+	}
+	shell, err := windowsPowerShellPath()
+	if err != nil {
+		return err
+	}
+	// Bypass is process-only. The default Restricted policy refuses a temp script.
+	// -NoExit keeps the prompt after -File returns; cleanup is the Exiting handler.
+	args := []string{"-NoLogo", "-ExecutionPolicy", "Bypass"}
+	if interactive {
+		args = append(args, "-NoExit")
+	}
+	args = append(args, "-File", scriptPath)
+	if wt, err := exec.LookPath("wt.exe"); err == nil {
+		return startDetached(exec.Command(wt, append([]string{"new-tab", "--", shell}, args...)...))
+	}
+	cmd := exec.Command(shell, args...)
+	applyNewConsole(cmd)
+	return startDetached(cmd)
+}
+
+func writeWindowsShellLauncher(kubeconfigPath, contextName string) (string, error) {
+	f, err := os.CreateTemp("", "klustr-shell-*.ps1")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	// The script returns immediately under -NoExit, so a try/finally would
+	// delete the kubeconfig before the prompt exists. The exit event runs
+	// when the window actually closes.
+	body := fmt.Sprintf(`$env:KUBECONFIG = %s
+$env:KLUSTR_CONTEXT = %s
+$env:KUBE_CONTEXT = %s
+Set-Location -ErrorAction SilentlyContinue $env:USERPROFILE
+$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
+}
+`, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(kubeconfigPath), psQuote(path))
+	return commitScript(f, path, "\uFEFF"+body)
+}
+
+func writeWindowsExecLauncher(kubeconfigPath, contextName, namespace, podName, container, shellPath string) (string, error) {
+	f, err := os.CreateTemp("", "klustr-exec-*.ps1")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	containerArg := ""
+	if container != "" {
+		containerArg = "-c " + psQuote(container) + " "
+	}
+	body := fmt.Sprintf(`$env:KUBECONFIG = %s
+$env:KLUSTR_CONTEXT = %s
+$env:KUBE_CONTEXT = %s
+try {
+    if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) {
+        Write-Host 'kubectl not found on PATH. Install kubectl or use the in-app Exec tab.'
+        Write-Host ''
+        Read-Host 'Press Enter to close'
+        exit 127
+    }
+    kubectl exec -it -n %s %s%s -- %s
+} finally {
+    Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
+}
+`, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(namespace), containerArg, psQuote(podName), psQuote(shellPath), psQuote(kubeconfigPath), psQuote(path))
+	return commitScript(f, path, "\uFEFF"+body)
+}
+
+func commitScript(f *os.File, path, body string) (string, error) {
+	if _, err := f.WriteString(body); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 // startDetached starts a launcher process and reaps it in the background. The
