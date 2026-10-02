@@ -4,6 +4,6 @@ package kube
 
 import "errors"
 
-func startInNewConsole([]string) error {
+func startInNewConsole([]string, []string, string, func()) error {
 	return errors.New("a new console window is Windows-only")
 }

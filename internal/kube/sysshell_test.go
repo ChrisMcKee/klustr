@@ -1,15 +1,12 @@
 package kube
 
 import (
-	"encoding/base64"
-	"encoding/binary"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf16"
 )
 
 func TestShellQuoteNeutralizesSubstitution(t *testing.T) {
@@ -76,46 +73,44 @@ func contextAssign(contextName string) string {
 	return "KLUSTR_CONTEXT=" + shellQuote(contextName)
 }
 
-func TestPSQuote(t *testing.T) {
-	if got := psQuote(`$(Invoke-Expression 'hi')`); got != `'$(Invoke-Expression ''hi'')'` {
-		t.Fatalf("psQuote = %q", got)
-	}
-	if got := psQuote("a'b"); got != "'a''b'" {
-		t.Fatalf("psQuote = %q", got)
-	}
-	// PowerShell closes a single-quoted string on a curly quote too.
-	if got := psQuote("x’; calc.exe; ‘"); got != "'x’’; calc.exe; ‘‘'" {
-		t.Fatalf("psQuote = %q", got)
-	}
-}
-
-func TestWindowsLauncherScriptsQuoteBreakout(t *testing.T) {
-	const evil = "’; calc.exe ’; calc.exe ‘"
-	quoted := psQuote(evil)
-	shellScript := windowsShellScript(`C:\temp\kc.yaml`, evil)
-	execScript := windowsExecScript(`C:\temp\kc.yaml`, evil, evil, evil, evil, evil)
-	for _, script := range []string{shellScript, execScript} {
-		if !strings.Contains(script, "$env:KLUSTR_CONTEXT = "+quoted) {
-			t.Fatalf("context name not PowerShell-quoted:\n%s", script)
+// The Windows launch commands are constants: every value, hostile context
+// names included, reaches PowerShell through the environment.
+func TestWindowsExecEnvCarriesValuesVerbatim(t *testing.T) {
+	const evil = `x’; calc.exe ‘ "$(calc.exe)" ; $env:PATH`
+	env := windowsExecEnv([]string{"KLUSTR_EXEC_CONTAINER=inherited"}, `C:\Temp\kc.yaml`, evil, evil+"-ns", evil+"-pod", "", evil+"-shell")
+	for key, want := range map[string]string{
+		"KUBECONFIG":            `C:\Temp\kc.yaml`,
+		"KLUSTR_KUBECONFIG":     `C:\Temp\kc.yaml`,
+		"KLUSTR_CONTEXT":        evil,
+		"KLUSTR_EXEC_NAMESPACE": evil + "-ns",
+		"KLUSTR_EXEC_POD":       evil + "-pod",
+		"KLUSTR_EXEC_CONTAINER": "",
+		"KLUSTR_EXEC_SHELL":     evil + "-shell",
+	} {
+		if got, _ := envValue(env, key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
 		}
 	}
-	if !strings.Contains(execScript, "kubectl exec -it -n "+quoted+" -c "+quoted+" "+quoted+" -- "+quoted) {
-		t.Fatalf("kubectl args not quoted:\n%s", execScript)
+}
+
+// A double quote would need escaping on its way to PowerShell. Without one,
+// windows.ComposeCommandLine only wraps the command in quotes.
+func TestWindowsLaunchCommandsAvoidDoubleQuotes(t *testing.T) {
+	for name, command := range map[string]string{"shell": windowsShellCommand, "exec": windowsExecCommand} {
+		if strings.Contains(command, `"`) {
+			t.Errorf("%s command contains a double quote:\n%s", name, command)
+		}
 	}
 }
 
-func TestPSEncodeIsBase64UTF16LE(t *testing.T) {
-	const script = "$env:KLUSTR_CONTEXT = ‘prod-ü-😀’\n"
-	raw, err := base64.StdEncoding.DecodeString(psEncode(script))
-	if err != nil {
-		t.Fatal(err)
+func TestWindowsLaunchArgv(t *testing.T) {
+	got := strings.Join(windowsLaunchArgv(`C:\pwsh.exe`, "cmd", true), " ")
+	if want := `C:\pwsh.exe -NoLogo -NoExit -Command cmd`; got != want {
+		t.Errorf("interactive argv = %q, want %q", got, want)
 	}
-	units := make([]uint16, len(raw)/2)
-	for i := range units {
-		units[i] = binary.LittleEndian.Uint16(raw[2*i:])
-	}
-	if got := string(utf16.Decode(units)); got != script {
-		t.Fatalf("decoded = %q, want %q", got, script)
+	got = strings.Join(windowsLaunchArgv(`C:\pwsh.exe`, "cmd", false), " ")
+	if want := `C:\pwsh.exe -NoLogo -Command cmd`; got != want {
+		t.Errorf("exec argv = %q, want %q", got, want)
 	}
 }
 

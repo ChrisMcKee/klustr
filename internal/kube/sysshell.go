@@ -1,8 +1,6 @@
 package kube
 
 import (
-	"encoding/base64"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-	"unicode/utf16"
 )
 
 // SystemTerminal is a terminal app discovered on the host. The frontend
@@ -28,24 +25,6 @@ type SystemTerminal struct {
 // double-quoted form that still runs $(...).
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-// psQuoteEscaper doubles every character PowerShell accepts as a single
-// quote: besides ', the tokenizer also takes the curly quotes U+2018-U+201B,
-// so doubling ' alone lets a ’ in the value close the string.
-var psQuoteEscaper = strings.NewReplacer(
-	"'", "''",
-	"‘", "‘‘",
-	"’", "’’",
-	"‚", "‚‚",
-	"‛", "‛‛",
-)
-
-// psQuote single-quotes s for PowerShell. A single-quoted string is literal
-// except for an embedded quote, which is doubled, so $(...), backticks and
-// $vars cannot break out. The context name comes from the kubeconfig.
-func psQuote(s string) string {
-	return "'" + psQuoteEscaper.Replace(s) + "'"
 }
 
 type darwinTerminalApp struct {
@@ -68,8 +47,8 @@ var darwinKnownTerminals = []darwinTerminalApp{
 
 // ListSystemTerminals returns the terminal emulators installed on the
 // host. On macOS this scans /Applications + ~/Applications; on Linux it
-// probes PATH. Windows has no picker list: an empty appID opens Windows
-// Terminal, or a new console when wt is not on PATH.
+// probes PATH. Windows has no picker list: an empty appID opens the
+// default terminal app.
 func (m *ClientManager) ListSystemTerminals() []SystemTerminal {
 	switch runtime.GOOS {
 	case "darwin":
@@ -98,8 +77,8 @@ func (m *ClientManager) OpenPodExecInSystemTerminal(
 		return err
 	}
 	if runtime.GOOS == "windows" {
-		script := windowsExecScript(kubeconfigPath, contextName, namespace, podName, container, shellPath)
-		if err := launchWindowsTerminal(script, appID, false); err != nil {
+		env := windowsExecEnv(os.Environ(), kubeconfigPath, contextName, namespace, podName, container, shellPath)
+		if err := launchWindowsConsole(appID, windowsExecCommand, false, env, kubeconfigPath); err != nil {
 			_ = os.Remove(kubeconfigPath)
 			return err
 		}
@@ -174,8 +153,8 @@ kubectl exec -it -n %s %s%s -- %s
 // OpenInSystemTerminal opens the user's login shell in an external terminal
 // with KUBECONFIG set to a single-context copy; an EXIT trap deletes the temp
 // kubeconfig and launcher script. appID is an id from ListSystemTerminals;
-// empty means the macOS .command handler, the Linux priority list, or
-// Windows Terminal (a new console when wt is not on PATH).
+// empty means the macOS .command handler, the Linux priority list, or the
+// Windows default terminal app.
 func (m *ClientManager) OpenInSystemTerminal(contextName, appID string) error {
 	if contextName == "" {
 		return fmt.Errorf("context name is required")
@@ -186,7 +165,8 @@ func (m *ClientManager) OpenInSystemTerminal(contextName, appID string) error {
 		return err
 	}
 	if runtime.GOOS == "windows" {
-		if err := launchWindowsTerminal(windowsShellScript(kubeconfigPath, contextName), appID, true); err != nil {
+		env := windowsLaunchEnv(os.Environ(), kubeconfigPath, contextName)
+		if err := launchWindowsConsole(appID, windowsShellCommand, true, env, kubeconfigPath); err != nil {
 			_ = os.Remove(kubeconfigPath)
 			return err
 		}
@@ -271,12 +251,16 @@ func windowsPowerShellPath() (string, error) {
 	return "", fmt.Errorf("PowerShell is not on PATH")
 }
 
-// launchWindowsTerminal runs script in a new PowerShell tab or window. The
-// script goes in as -EncodedCommand rather than a temp .ps1: execution
-// policy covers script files only, and a Group Policy one (AllSigned, say)
-// overrides -ExecutionPolicy Bypass. -NoExit keeps the prompt once the
-// script returns.
-func launchWindowsTerminal(script, appID string, interactive bool) error {
+// launchWindowsConsole runs PowerShell in a console of its own, which Windows
+// opens in the default terminal app (Windows Terminal unless the user picked
+// another). wt.exe is not called directly: it splits its command line at
+// every ';' and rejoins arguments without escaping their quotes. command is
+// a constant and every value reaches it through env, so nothing from the
+// kubeconfig is ever parsed as PowerShell, and the command line carries no
+// encoded payload for endpoint security rules to flag. Execution policy
+// covers script files, not -Command. The kubeconfig is removed once the
+// window closes, or by SweepStaleLaunchFiles if klustr quit first.
+func launchWindowsConsole(appID, command string, interactive bool, env []string, kubeconfigPath string) error {
 	if appID != "" {
 		return fmt.Errorf("unknown terminal app %q", appID)
 	}
@@ -284,86 +268,79 @@ func launchWindowsTerminal(script, appID string, interactive bool) error {
 	if err != nil {
 		return err
 	}
-	args := []string{"-NoLogo"}
+	home, _ := os.UserHomeDir()
+	return startInNewConsole(windowsLaunchArgv(shell, command, interactive), env, home, func() {
+		_ = os.Remove(kubeconfigPath)
+	})
+}
+
+// windowsLaunchArgv adds -NoExit to keep the prompt once command returns.
+func windowsLaunchArgv(shell, command string, interactive bool) []string {
+	argv := []string{shell, "-NoLogo"}
 	if interactive {
-		args = append(args, "-NoExit")
+		argv = append(argv, "-NoExit")
 	}
-	args = append(args, "-EncodedCommand", psEncode(script))
-	if wt, err := exec.LookPath("wt.exe"); err == nil {
-		return startDetached(exec.Command(wt, append([]string{"new-tab", "--", shell}, args...)...))
-	}
-	return startInNewConsole(append([]string{shell}, args...))
+	return append(argv, "-Command", command)
 }
 
-// psEncode encodes script the way -EncodedCommand takes it: base64 over
-// UTF-16LE.
-func psEncode(script string) string {
-	var b []byte
-	for _, c := range utf16.Encode([]rune(script)) {
-		b = binary.LittleEndian.AppendUint16(b, c)
-	}
-	return base64.StdEncoding.EncodeToString(b)
+// windowsLaunchEnv is base plus everything a launch command reads. The
+// commands take the kubeconfig from KLUSTR_KUBECONFIG and set KUBECONFIG
+// again: the user's profile runs before them and may set its own.
+func windowsLaunchEnv(base []string, kubeconfigPath, contextName string) []string {
+	return append(contextEnv(base, kubeconfigPath, contextName), "KLUSTR_KUBECONFIG="+kubeconfigPath)
 }
 
-// windowsShellScript sets up the interactive session. It finishes before the
+func windowsExecEnv(base []string, kubeconfigPath, contextName, namespace, podName, container, shellPath string) []string {
+	return append(windowsLaunchEnv(base, kubeconfigPath, contextName),
+		"KLUSTR_EXEC_NAMESPACE="+namespace,
+		"KLUSTR_EXEC_POD="+podName,
+		// Set even when empty, so the container can't come from klustr's
+		// own environment.
+		"KLUSTR_EXEC_CONTAINER="+container,
+		"KLUSTR_EXEC_SHELL="+shellPath,
+	)
+}
+
+// windowsShellCommand sets up the interactive session. It returns before the
 // prompt appears under -NoExit, so a try/finally would delete the kubeconfig
 // at once; the exit event runs when the session exits. It deletes through
 // .NET: the runspace is already closing and can't load a module, so a
 // Remove-Item whose module isn't loaded yet fails, silently under
 // SilentlyContinue. The open handle, which shares read and write but not
 // delete, keeps SweepStaleLaunchFiles off the kubeconfig while the session
-// lives. It reaches the action through a global: PowerShell.Exiting leaves
+// lives. The action reads the path from a global: PowerShell.Exiting leaves
 // $Event.MessageData null.
-func windowsShellScript(kubeconfigPath, contextName string) string {
-	return fmt.Sprintf(`$env:KUBECONFIG = %s
-$env:KLUSTR_CONTEXT = %s
-$env:KUBE_CONTEXT = %s
-Set-Location -ErrorAction SilentlyContinue $env:USERPROFILE
-$global:KlustrKubeconfigLock = [IO.File]::Open($env:KUBECONFIG, 'Open', 'Read', 'ReadWrite')
-$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-    $global:KlustrKubeconfigLock.Dispose()
-    [IO.File]::Delete(%s)
-}
-`, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(kubeconfigPath))
-}
+var windowsShellCommand = strings.Join([]string{
+	`$global:KlustrKubeconfig = $env:KLUSTR_KUBECONFIG`,
+	`$env:KUBECONFIG = $global:KlustrKubeconfig`,
+	`$global:KlustrKubeconfigLock = [IO.File]::Open($global:KlustrKubeconfig, 'Open', 'Read', 'ReadWrite')`,
+	`$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { $global:KlustrKubeconfigLock.Dispose(); [IO.File]::Delete($global:KlustrKubeconfig) }`,
+}, "; ")
 
-func windowsExecScript(kubeconfigPath, contextName, namespace, podName, container, shellPath string) string {
-	containerArg := ""
-	if container != "" {
-		containerArg = "-c " + psQuote(container) + " "
-	}
-	// The lock keeps SweepStaleLaunchFiles off the kubeconfig, as in
-	// windowsShellScript. A failed exec (pod gone, RBAC, no such shell)
-	// waits for Enter: the window would otherwise close over the error.
-	return fmt.Sprintf(`$env:KUBECONFIG = %s
-$env:KLUSTR_CONTEXT = %s
-$env:KUBE_CONTEXT = %s
-$kubeconfigLock = [IO.File]::Open($env:KUBECONFIG, 'Open', 'Read', 'ReadWrite')
-try {
-    if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) {
-        Write-Host 'kubectl not found on PATH. Install kubectl or use the in-app Exec tab.'
-        Write-Host ''
-        Read-Host 'Press Enter to close'
-        exit 127
-    }
-    kubectl exec -it -n %s %s%s -- %s
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host ''
-        Read-Host "kubectl exited with code $LASTEXITCODE. Press Enter to close"
-    }
-} finally {
-    $kubeconfigLock.Dispose()
-    Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
-}
-`, psQuote(kubeconfigPath), psQuote(contextName), psQuote(contextName), psQuote(namespace), containerArg, psQuote(podName), psQuote(shellPath), psQuote(kubeconfigPath))
-}
+// windowsExecCommand runs kubectl exec from the KLUSTR_EXEC_* variables. The
+// lock keeps SweepStaleLaunchFiles off the kubeconfig, as in
+// windowsShellCommand. A failed exec (pod gone, RBAC, no such shell) waits
+// for Enter: the window would otherwise close over the error.
+var windowsExecCommand = strings.Join([]string{
+	`$env:KUBECONFIG = $env:KLUSTR_KUBECONFIG`,
+	`$kubeconfigLock = [IO.File]::Open($env:KLUSTR_KUBECONFIG, 'Open', 'Read', 'ReadWrite')`,
+	`try { ` + strings.Join([]string{
+		`if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) { Write-Host 'kubectl not found on PATH. Install kubectl or use the in-app Exec tab.'; Write-Host ''; Read-Host 'Press Enter to close'; exit 127 }`,
+		`$kubectlArgs = @('exec', '-it', '-n', $env:KLUSTR_EXEC_NAMESPACE)`,
+		`if ($env:KLUSTR_EXEC_CONTAINER) { $kubectlArgs += @('-c', $env:KLUSTR_EXEC_CONTAINER) }`,
+		`$kubectlArgs += @($env:KLUSTR_EXEC_POD, '--', $env:KLUSTR_EXEC_SHELL)`,
+		`kubectl @kubectlArgs`,
+		`if ($LASTEXITCODE -ne 0) { Write-Host ''; Read-Host ('kubectl exited with code {0}. Press Enter to close' -f $LASTEXITCODE) }`,
+	}, "; ") + ` } finally { $kubeconfigLock.Dispose(); Remove-Item -LiteralPath $env:KLUSTR_KUBECONFIG -Force -ErrorAction SilentlyContinue }`,
+}, "; ")
 
 // staleLaunchFileAge covers the moment before a new terminal opens its
 // kubeconfig, which another klustr instance's sweep could otherwise hit.
 const staleLaunchFileAge = 24 * time.Hour
 
 // SweepStaleLaunchFiles deletes the temp kubeconfigs that external Windows
-// terminals leave behind: closing the window skips PowerShell's Exiting
+// terminals leave behind: klustr removes one when its window closes, but not
+// once klustr has quit, and closing the window skips PowerShell's Exiting
 // handler. Unix launchers clean up in their EXIT trap instead. A live
 // terminal, in-app or external, holds its kubeconfig open without
 // FILE_SHARE_DELETE, so Windows refuses to delete it and the sweep only
