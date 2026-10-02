@@ -2,9 +2,11 @@ package kube
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestShellQuoteNeutralizesSubstitution(t *testing.T) {
@@ -113,5 +115,43 @@ func TestWriteWindowsLaunchersQuoteBreakout(t *testing.T) {
 	}
 	if !strings.Contains(string(execBody), "kubectl exec -it -n "+quoted+" -c "+quoted+" "+quoted+" -- "+quoted) {
 		t.Fatalf("kubectl args not quoted:\n%s", execBody)
+	}
+}
+
+func TestSweepStaleLaunchFilesRemovesOnlyOldLaunchFiles(t *testing.T) {
+	dir := t.TempDir()
+	cutoff := time.Now().Add(-staleLaunchFileAge)
+	old := cutoff.Add(-time.Hour)
+	write := func(name string, mtime time.Time) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	stale := []string{
+		write("klustr-kubeconfig-1.yaml", old),
+		write("klustr-shell-1.ps1", old),
+		write("klustr-exec-1.sh", old),
+	}
+	kept := []string{
+		write("klustr-kubeconfig-2.yaml", time.Now()),
+		write("other-kubeconfig-1.yaml", old),
+	}
+
+	sweepStaleLaunchFiles(dir, cutoff)
+
+	for _, p := range stale {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("stale file %s not removed", filepath.Base(p))
+		}
+	}
+	for _, p := range kept {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("file %s removed: %v", filepath.Base(p), err)
+		}
 	}
 }

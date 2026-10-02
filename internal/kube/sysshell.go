@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // SystemTerminal is a terminal app discovered on the host. The frontend
@@ -258,7 +259,8 @@ func launchWindowsTerminal(scriptPath, appID string, interactive bool) error {
 		return err
 	}
 	// Bypass is process-only. The default Restricted policy refuses a temp script.
-	// -NoExit keeps the prompt after -File returns; cleanup is the Exiting handler.
+	// -NoExit keeps the prompt after -File returns; cleanup is the Exiting
+	// handler, backed by SweepStaleLaunchFiles when the window is closed.
 	args := []string{"-NoLogo", "-ExecutionPolicy", "Bypass"}
 	if interactive {
 		args = append(args, "-NoExit")
@@ -337,6 +339,33 @@ func commitScript(f *os.File, path, body string) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// staleLaunchFileAge is how long a launcher's temp files may outlive it
+const staleLaunchFileAge = 24 * time.Hour
+
+var launchFilePatterns = []string{
+	"klustr-kubeconfig-*.yaml",
+	"klustr-shell-*",
+	"klustr-exec-*",
+}
+
+// SweepStaleLaunchFiles deletes abandoned temp kubeconfigs and launcher scripts
+func (m *ClientManager) SweepStaleLaunchFiles() {
+	sweepStaleLaunchFiles(os.TempDir(), time.Now().Add(-staleLaunchFileAge))
+}
+
+func sweepStaleLaunchFiles(dir string, cutoff time.Time) {
+	for _, pattern := range launchFilePatterns {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		for _, path := range matches {
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() || info.ModTime().After(cutoff) {
+				continue
+			}
+			_ = os.Remove(path)
+		}
+	}
 }
 
 // startDetached starts a launcher process and reaps it in the background. The
