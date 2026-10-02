@@ -292,9 +292,7 @@ func launchWindowsTerminal(script, appID string, interactive bool) error {
 	if wt, err := exec.LookPath("wt.exe"); err == nil {
 		return startDetached(exec.Command(wt, append([]string{"new-tab", "--", shell}, args...)...))
 	}
-	cmd := exec.Command(shell, args...)
-	applyNewConsole(cmd)
-	return startDetached(cmd)
+	return startInNewConsole(append([]string{shell}, args...))
 }
 
 // psEncode encodes script the way -EncodedCommand takes it: base64 over

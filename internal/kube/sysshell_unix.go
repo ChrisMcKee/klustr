@@ -2,6 +2,8 @@
 
 package kube
 
-import "os/exec"
+import "errors"
 
-func applyNewConsole(*exec.Cmd) {}
+func startInNewConsole([]string) error {
+	return errors.New("a new console window is Windows-only")
+}
