@@ -27,11 +27,22 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// psQuoteEscaper doubles every character PowerShell accepts as a single
+// quote: besides ', the tokenizer also takes the curly quotes U+2018-U+201B,
+// so doubling ' alone lets a ’ in the value close the string.
+var psQuoteEscaper = strings.NewReplacer(
+	"'", "''",
+	"‘", "‘‘",
+	"’", "’’",
+	"‚", "‚‚",
+	"‛", "‛‛",
+)
+
 // psQuote single-quotes s for PowerShell. A single-quoted string is literal
 // except for an embedded quote, which is doubled, so $(...), backticks and
 // $vars cannot break out. The context name comes from the kubeconfig.
 func psQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	return "'" + psQuoteEscaper.Replace(s) + "'"
 }
 
 type darwinTerminalApp struct {

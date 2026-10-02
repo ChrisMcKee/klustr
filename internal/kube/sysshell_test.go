@@ -83,10 +83,14 @@ func TestPSQuote(t *testing.T) {
 	if got := psQuote("a'b"); got != "'a''b'" {
 		t.Fatalf("psQuote = %q", got)
 	}
+	// PowerShell closes a single-quoted string on a curly quote too.
+	if got := psQuote("x’; calc.exe; ‘"); got != "'x’’; calc.exe; ‘‘'" {
+		t.Fatalf("psQuote = %q", got)
+	}
 }
 
 func TestWriteWindowsLaunchersQuoteBreakout(t *testing.T) {
-	const evil = `'; calc.exe '`
+	const evil = "'; calc.exe ’; calc.exe '"
 	shellPath, err := writeWindowsShellLauncher(`C:\temp\kc.yaml`, evil)
 	if err != nil {
 		t.Fatal(err)
