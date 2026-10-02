@@ -333,7 +333,8 @@ func windowsExecScript(kubeconfigPath, contextName, namespace, podName, containe
 		containerArg = "-c " + psQuote(container) + " "
 	}
 	// The lock keeps SweepStaleLaunchFiles off the kubeconfig, as in
-	// windowsShellScript.
+	// windowsShellScript. A failed exec (pod gone, RBAC, no such shell)
+	// waits for Enter: the window would otherwise close over the error.
 	return fmt.Sprintf(`$env:KUBECONFIG = %s
 $env:KLUSTR_CONTEXT = %s
 $env:KUBE_CONTEXT = %s
@@ -346,6 +347,10 @@ try {
         exit 127
     }
     kubectl exec -it -n %s %s%s -- %s
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ''
+        Read-Host "kubectl exited with code $LASTEXITCODE. Press Enter to close"
+    }
 } finally {
     $kubeconfigLock.Dispose()
     Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue
