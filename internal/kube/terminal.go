@@ -239,7 +239,32 @@ func terminalEnv(base []string, kubeconfigPath, contextName, locale string) []st
 	if locale != "" && !hasEnvKey(env, "LANG") && !hasEnvKey(env, "LC_ALL") && !hasEnvKey(env, "LC_CTYPE") {
 		env = append(env, "LANG="+locale)
 	}
+	if runtime.GOOS == "windows" {
+		// wsl.exe forwards a variable only when WSLENV names it, and /p
+		// rewrites the Win32 path so `wsl` keeps this tab's kubeconfig.
+		env = append(env, "WSLENV="+wslEnvKubeconfig(env))
+	}
 	return env
+}
+
+func wslEnvKubeconfig(env []string) string {
+	var existing string
+	for _, e := range env {
+		name, v, ok := strings.Cut(e, "=")
+		if ok && strings.EqualFold(name, "WSLENV") {
+			existing = v
+		}
+	}
+	for part := range strings.SplitSeq(existing, ":") {
+		name, _, _ := strings.Cut(part, "/")
+		if strings.EqualFold(strings.TrimSpace(name), "KUBECONFIG") {
+			return existing
+		}
+	}
+	if existing == "" {
+		return "KUBECONFIG/p"
+	}
+	return existing + ":KUBECONFIG/p"
 }
 
 // defaultUTF8Locale returns a UTF-8 locale that `locale -a` confirms exists,

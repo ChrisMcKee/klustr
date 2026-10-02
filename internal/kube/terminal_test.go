@@ -2,6 +2,7 @@ package kube
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 )
 
@@ -57,6 +58,33 @@ func TestTerminalEnvSkipsLocaleWhenNoneConfirmed(t *testing.T) {
 	}
 	if v, ok := envValue(env, "TERM"); !ok || v != "xterm-256color" {
 		t.Errorf("TERM = %q (set=%v), want xterm-256color even with empty locale", v, ok)
+	}
+}
+
+func TestWSLEnvKubeconfig(t *testing.T) {
+	if got := wslEnvKubeconfig(nil); got != "KUBECONFIG/p" {
+		t.Errorf("empty = %q, want KUBECONFIG/p", got)
+	}
+	if got := wslEnvKubeconfig([]string{"WSLENV=FOO/p"}); got != "FOO/p:KUBECONFIG/p" {
+		t.Errorf("append = %q", got)
+	}
+	const already = "FOO/p:KUBECONFIG/up"
+	if got := wslEnvKubeconfig([]string{"WSLENV=" + already}); got != already {
+		t.Errorf("existing = %q, want %q", got, already)
+	}
+}
+
+func TestTerminalEnvSharesKubeconfigWithWSL(t *testing.T) {
+	env := terminalEnv([]string{"WSLENV=FOO/p"}, `C:\Temp\klustr.yaml`, "prod", "")
+	got, _ := envValue(env, "WSLENV")
+	if runtime.GOOS != "windows" {
+		if got != "FOO/p" {
+			t.Errorf("WSLENV changed on %s: %q", runtime.GOOS, got)
+		}
+		return
+	}
+	if got != "FOO/p:KUBECONFIG/p" {
+		t.Errorf("WSLENV = %q, want FOO/p:KUBECONFIG/p", got)
 	}
 }
 
